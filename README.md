@@ -1,4 +1,5 @@
-TSD-NET: Two-Stage Decomposition Network for Short-Term Load Forecasting
+A Novel Two-Stage Forecasting Framework with Difference-Based
+Learning for Power Load Forecasting
 
 This repository provides the official PyTorch implementation of TSD-NET, a two-stage deep learning framework for short-term electric load forecasting under non-stationary conditions.
 
