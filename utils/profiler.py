@@ -149,7 +149,7 @@ class StageProfiler:
             macs = out_elems * kernel_mul
             self._mac_bucket_current += macs
 
-        def _mac_gru(m: nn.GRU, inp, out):
+        def _mac_rnn(m, inp, out):
             if not self._stage_stack:
                 return
             x = inp[0]
@@ -163,8 +163,9 @@ class StageProfiler:
             layers = m.num_layers
             dirs = 2 if m.bidirectional else 1
 
-            # Rough estimate: per time step, GRU uses 3 gates with (I*H + H*H) multiplications
-            macs = L * B * layers * dirs * (3 * (I * H + H * H))
+            # Rough estimate: per time step, GRU uses 3 gates and LSTM uses 4 gates with (I*H + H*H) multiplications
+            gate_num = 4 if isinstance(m, nn.LSTM) else 3
+            macs = L * B * layers * dirs * (gate_num * (I * H + H * H))
             self._mac_bucket_current += macs
 
         for m in model.modules():
@@ -172,8 +173,8 @@ class StageProfiler:
                 self._hooks.append(m.register_forward_hook(_mac_linear))
             elif isinstance(m, nn.Conv1d):
                 self._hooks.append(m.register_forward_hook(_mac_conv1d))
-            elif isinstance(m, nn.GRU):
-                self._hooks.append(m.register_forward_hook(_mac_gru))
+            elif isinstance(m, (nn.GRU, nn.LSTM)):
+                self._hooks.append(m.register_forward_hook(_mac_rnn))
 
     # ============================================================
     # 2) Batch-level phase profiling (forward / backward / optim)
