@@ -1,127 +1,137 @@
 import torch
 import torch.nn as nn
+
 from .basic_block import BasicBlock
-# stack.py 顶部
 from utils.profiler import StageProfiler
 
 
 class Stack(nn.Module):
-    def __init__(self,
-                 input_size: int,
-                 encoder_channels,
-                 input_seqlen: int,
-                 forecast_seqlen: int,
-                 num_blocks: int = 3):
-        """
-        :param input_size: 第一个 block 的输入维度
-        :param encoder_channels: 每个 block 里 encoder 的通道数列表
-        :param input_seqlen: 输入序列长度
-        :param forecast_seqlen: 输出预测序列长度
-        :param num_blocks: block 的总数 (>=1)
-        """
-        super(Stack, self).__init__()
+    """
+    TSD-NET stack.
 
-        self.num_blocks = num_blocks
-        self.forecast_seqlen = forecast_seqlen
+    Terminology used in the paper/rebuttal:
+    "two-stage" = baseline trend estimation + residual refinement.
+    Multiple DGR blocks are iterative refinement units inside the second stage,
+    not additional third/fourth forecasting stages.
+    """
 
-        # 第一个block的输入维度是input_size
+    def __init__(
+        self,
+        input_size: int,
+        encoder_channels,
+        input_seqlen: int,
+        forecast_seqlen: int,
+        num_blocks: int = 3,
+        kernel_size: int = 4,
+        dropout: float = 0.2,
+        enable_profiler: bool = True,
+    ):
+        super().__init__()
+        if num_blocks < 1:
+            raise ValueError("num_blocks must be >= 1")
+        self.num_blocks = int(num_blocks)
+        self.forecast_seqlen = int(forecast_seqlen)
+        self.input_seqlen = int(input_seqlen)
+
         self.block_first = BasicBlock(
             input_size=input_size,
             encoder_num_channels=encoder_channels,
             forecast_seqlen=forecast_seqlen,
-            estimate_seqlen=input_seqlen
+            estimate_seqlen=input_seqlen,
+            kernel_size=kernel_size,
+            dropout=dropout,
         )
-
-        # 后续block的输入维度都固定为1，可根据需要修改
-        self.blocks_rest = nn.ModuleList()
-        for _ in range(num_blocks - 1):
-            block = BasicBlock(
+        self.blocks_rest = nn.ModuleList([
+            BasicBlock(
                 input_size=1,
                 encoder_num_channels=encoder_channels,
                 forecast_seqlen=forecast_seqlen,
-                estimate_seqlen=input_seqlen
+                estimate_seqlen=input_seqlen,
+                kernel_size=kernel_size,
+                dropout=dropout,
             )
-            self.blocks_rest.append(block)
+            for _ in range(num_blocks - 1)
+        ])
 
-        # gated fusion MLP 仅基于 m_j 本身
-        self.fusion_weight_mlp = nn.Sequential(
-            nn.Linear(forecast_seqlen, forecast_seqlen),
+        self.fusion_score_mlp = nn.Sequential(
+            nn.Linear(2 * forecast_seqlen, forecast_seqlen),
             nn.ReLU(),
             nn.Linear(forecast_seqlen, forecast_seqlen),
-            nn.Sigmoid()
         )
-        self.profiler = StageProfiler()
 
-        def _register_block_stages(block, idx):
-            # ENCODER
-            if hasattr(block, "encoder"):
-                self.profiler.register_stage(block.encoder, f"block{idx}/ENCODER")
-                self.profiler.add_params_of(block.encoder, f"block{idx}/ENCODER")
+        self.profiler = StageProfiler() if enable_profiler else None
+        if self.profiler is not None:
+            self._register_profiler_hooks()
 
-            # ----- DECODER-F (forecast) -----
-            if hasattr(block, "f_decoder"):
-                if hasattr(block.f_decoder, "gru"):
-                    self.profiler.register_stage(block.f_decoder.gru, f"block{idx}/DECODER_F")
-                    self.profiler.add_params_of(block.f_decoder.gru, f"block{idx}/DECODER_F")
-                if hasattr(block.f_decoder, "fc"):
-                    # fc 也算到 DECODER（避免和 AR 重复）
-                    self.profiler.register_stage(block.f_decoder.fc, f"block{idx}/DECODER_F")
-                    self.profiler.add_params_of(block.f_decoder.fc, f"block{idx}/DECODER_F")
+    def _register_profiler_hooks(self) -> None:
+        def register_block(block: BasicBlock, idx: int):
+            prefix = f"block{idx}"
+            self.profiler.register_stage(block.encoder, f"{prefix}/ENCODER")
+            self.profiler.add_params_of(block.encoder, f"{prefix}/ENCODER")
+            for dec_name, dec in (("DECODER_F", block.f_decoder), ("DECODER_E", block.e_decoder)):
+                self.profiler.register_stage(dec.rnn, f"{prefix}/{dec_name}")
+                self.profiler.add_params_of(dec.rnn, f"{prefix}/{dec_name}")
+                self.profiler.register_stage(dec.fc, f"{prefix}/{dec_name}")
+                self.profiler.add_params_of(dec.fc, f"{prefix}/{dec_name}")
+            self.profiler.register_stage(block.hidden_to_input, f"{prefix}/DECODER_E")
+            self.profiler.add_params_of(block.hidden_to_input, f"{prefix}/DECODER_E")
+            self.profiler.register_stage(block.ar_layer, f"{prefix}/AR_HEAD")
+            self.profiler.add_params_of(block.ar_layer, f"{prefix}/AR_HEAD")
+            self.profiler.register_stage(block.dag, f"{prefix}/DAG")
+            self.profiler.add_params_of(block.dag, f"{prefix}/DAG")
+            self.profiler.register_stage(block.gds_to_horizon, f"{prefix}/GDS_PROJ")
+            self.profiler.add_params_of(block.gds_to_horizon, f"{prefix}/GDS_PROJ")
 
-            # ----- DECODER-E (estimate) -----
-            if hasattr(block, "e_decoder"):
-                if hasattr(block.e_decoder, "gru"):
-                    self.profiler.register_stage(block.e_decoder.gru, f"block{idx}/DECODER_E")
-                    self.profiler.add_params_of(block.e_decoder.gru, f"block{idx}/DECODER_E")
-                if hasattr(block.e_decoder, "fc"):
-                    self.profiler.register_stage(block.e_decoder.fc, f"block{idx}/DECODER_E")
-                    self.profiler.add_params_of(block.e_decoder.fc, f"block{idx}/DECODER_E")
-
-            # hidden_to_input 也归到 DECODER（属于解码相关的预处理）
-            if hasattr(block, "hidden_to_input"):
-                self.profiler.register_stage(block.hidden_to_input, f"block{idx}/DECODER_E")
-                self.profiler.add_params_of(block.hidden_to_input, f"block{idx}/DECODER_E")
-
-            # ----- AR 头（你专门的自回归层） -----
-            if hasattr(block, "ar_layer"):
-                self.profiler.register_stage(block.ar_layer, f"block{idx}/AR_HEAD")
-                self.profiler.add_params_of(block.ar_layer, f"block{idx}/AR_HEAD")
-
-            # ----- DAG 门控 -----
-            if hasattr(block, "dag"):
-                self.profiler.register_stage(block.dag, f"block{idx}/DAG")
-                self.profiler.add_params_of(block.dag, f"block{idx}/DAG")
-
-        # 对第一个和后续 block 逐个登记  # NEW
-
-        _register_block_stages(self.block_first, 1)
+        register_block(self.block_first, 1)
         for i, b in enumerate(self.blocks_rest, start=2):
-            _register_block_stages(b, i)
-
-        # 让 Linear/Conv1d/GRU 具备 MACs 统计钩子  # NEW
+            register_block(b, i)
+        self.profiler.register_stage(self.fusion_score_mlp, "GATED_FUSION")
+        self.profiler.add_params_of(self.fusion_score_mlp, "GATED_FUSION")
         self.profiler.register_macs_hooks(self)
-    def forward(self, inputs):
-        """
-        融合所有 block 的预测结果，使用 gated fusion 权重计算：
-        \hat{Y} = \sum_j \alpha_j \cdot m_j，其中 \alpha_j = \text{MLP}(m_j)
-        """
-        forecasts = []
 
-        # 第一个 block
-        forecast, residual, ar_predictions, estimate_outputs, _ = self.block_first(inputs)
-        forecasts.append(forecast)
 
-        # 后续 blocks
+    def forward_ar_only(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Fast AR-only pass for Stage 1 pretraining.
+
+        To keep all AR heads trainable without invoking the LSTM decoders, later
+        blocks receive the observed load channel as their input proxy.
+        """
+        ar_predictions = [self.block_first.ar_forward(inputs)]
+        current = inputs[:, :, 0:1]
         for block in self.blocks_rest:
-            forecast_i, residual, _, _, _ = block(residual)
-            forecasts.append(forecast_i)
+            ar_predictions.append(block.ar_forward(current))
+        return torch.stack(ar_predictions, dim=1).mean(dim=1)  # [B, H, 1]
 
-        # Gated fusion，仅基于 m_j
-        final_forecast = 0
-        for m_j in forecasts:
-            alpha_j = self.fusion_weight_mlp(m_j.squeeze(-1)).unsqueeze(-1)  # [B, T, 1]
-            final_forecast += alpha_j * m_j
+    def forward(self, inputs: torch.Tensor):
+        forecasts, gdss, ars, estimates, block_inputs = [], [], [], [], []
+        forecast, residual, ar_pred, estimate, input_main, gds_h = self.block_first(inputs)
+        forecasts.append(forecast); gdss.append(gds_h); ars.append(ar_pred)
+        estimates.append(estimate); block_inputs.append(input_main)
 
-        return final_forecast, residual, ar_predictions, estimate_outputs
+        for block in self.blocks_rest:
+            forecast, residual, ar_pred, estimate, input_main, gds_h = block(residual)
+            forecasts.append(forecast); gdss.append(gds_h); ars.append(ar_pred)
+            estimates.append(estimate); block_inputs.append(input_main)
 
+        forecast_stack = torch.stack(forecasts, dim=1)  # [B, D, H, 1]
+        gds_stack = torch.stack(gdss, dim=1)            # [B, D, H, 1]
+        ar_stack = torch.stack(ars, dim=1)              # [B, D, H, 1]
 
+        scores = []
+        for m_j, gds_j in zip(forecasts, gdss):
+            fusion_input = torch.cat([m_j.squeeze(-1), gds_j.squeeze(-1)], dim=-1)
+            scores.append(self.fusion_score_mlp(fusion_input))
+        score_stack = torch.stack(scores, dim=1)  # [B, D, H]
+        fusion_weights = torch.softmax(score_stack, dim=1).unsqueeze(-1)
+        final_forecast = torch.sum(fusion_weights * forecast_stack, dim=1)  # [B, H, 1]
+
+        aux = {
+            "forecast_stack": forecast_stack,
+            "gds_stack": gds_stack,
+            "ar_stack": ar_stack,
+            "estimate_outputs": estimates,
+            "block_inputs": block_inputs,
+            "fusion_weights": fusion_weights,
+        }
+        ar_mean = ar_stack.mean(dim=1)
+        return final_forecast, gds_stack, ar_mean, aux
