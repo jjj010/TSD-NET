@@ -2,104 +2,126 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import weight_norm
 
+
 class Chomp1d(nn.Module):
-    def __init__(self, chomp_size):
-        super(Chomp1d, self).__init__()
-        self.chomp_size = chomp_size
+    """Remove the extra right-padding introduced by causal convolution."""
 
-    def forward(self, x):
-        '''裁剪多出来的时间步
-        param:
-            x shape: [batch_size, features, seq_len]
-        return :
-            shape: [batch_size, features, seq_len-self.chomp_size]
-        '''
+    def __init__(self, chomp_size: int):
+        super().__init__()
+        self.chomp_size = int(chomp_size)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.chomp_size == 0:
+            return x.contiguous()
         return x[:, :, :-self.chomp_size].contiguous()
 
 
 class TemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
-        '''
-        note: 一个标准的残差块，每个残差块中只有两层卷积，且每层卷积的膨胀因子是相同的，
-              因此，如果想要构建膨胀因子呈指数增长的编码器，就需要多个残差块串联起来
-        :param n_inputs: 一维卷积输入维度，就是每个卷积核的通道数
-        :param n_outputs: 一维卷积输出维度，就是卷积核的个数
-        :param kernel_size: 卷积核大小
-        :param stride: 卷积步长 为 1
-        :param dilation: 膨胀因子,在每个残差块中的两层卷积中，膨胀因子是相同的
-        :param padding:为了保证残差块输入输出相同，padding = dilation * (kernel_size-1)
-        :param dropout
-        '''
-        super(TemporalBlock, self).__init__()
-        # first part
-        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation))
+    """A residual TCN block with two causal dilated Conv1d layers."""
+
+    def __init__(
+        self,
+        n_inputs: int,
+        n_outputs: int,
+        kernel_size: int,
+        stride: int,
+        dilation: int,
+        padding: int,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.conv1 = weight_norm(
+            nn.Conv1d(
+                n_inputs,
+                n_outputs,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
         self.chomp1 = Chomp1d(padding)
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
-        # second part
-        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation))
+        self.conv2 = weight_norm(
+            nn.Conv1d(
+                n_outputs,
+                n_outputs,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
         self.chomp2 = Chomp1d(padding)
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
-        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
-                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
-        # 1*1 的卷积
+        self.net = nn.Sequential(
+            self.conv1,
+            self.chomp1,
+            self.relu1,
+            self.dropout1,
+            self.conv2,
+            self.chomp2,
+            self.relu2,
+            self.dropout2,
+        )
         self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
         self.relu = nn.ReLU()
         self.init_weights()
 
-    def init_weights(self):
+    def init_weights(self) -> None:
         self.conv1.weight.data.normal_(0, 0.01)
         self.conv2.weight.data.normal_(0, 0.01)
         if self.downsample is not None:
             self.downsample.weight.data.normal_(0, 0.01)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.net(x)
         res = x if self.downsample is None else self.downsample(x)
         return self.relu(out + res)
 
 
 class TcnEncoder(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=4, dropout=0.2):
-        '''
-        note:编码器，每个编码器里面有len(num_channels)个残差块，每个残差块里面有两层相同的卷积+dropout结构
-            len(num_channels)个残差块中卷积核的dilation_size 分别为[1,2,4,8,... ]
-        param:
-            num_inputs: [int] 输入时间序列的特征维度
-            num_channels: [List] 编码器里面的残差块中的卷积层的特征数
-            kernel_size: [int] 卷积核的大小
-        '''
+    """
+    TCN encoder used by TSD-NET.
 
-        super(TcnEncoder, self).__init__()
+    Args:
+        num_inputs: Number of input variables/channels.
+        num_channels: Hidden channels of stacked TCN residual blocks.
+        kernel_size: Temporal convolution kernel size.
+        dropout: Dropout ratio.
+
+    Input shape:
+        [B, C, T]
+
+    Output shape:
+        [1, B, hidden_size], used as the initial recurrent decoder state.
+    """
+
+    def __init__(self, num_inputs: int, num_channels, kernel_size: int = 4, dropout: float = 0.2):
+        super().__init__()
         layers = []
         num_levels = len(num_channels)
         for i in range(num_levels):
             dilation_size = 2 ** i
             in_channels = num_inputs if i == 0 else num_channels[i - 1]
             out_channels = num_channels[i]
-            layers += [TemporalBlock(n_inputs=in_channels,
-                                     n_outputs=out_channels,
-                                     kernel_size=kernel_size,
-                                     stride=1,
-                                     dilation=dilation_size,
-                                     padding=(kernel_size - 1) * dilation_size,
-                                     dropout=dropout)]
-
+            layers.append(
+                TemporalBlock(
+                    n_inputs=in_channels,
+                    n_outputs=out_channels,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    dilation=dilation_size,
+                    padding=(kernel_size - 1) * dilation_size,
+                    dropout=dropout,
+                )
+            )
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x):
-        '''
-        param:
-            x: the shape of x [batch, input_channel, seq_len]
-        return:
-            shape:[1, batch, output_channel], as a context vector into decoder
-        '''
-        # output shape:[batch, output_channel, seq_len]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = self.network(x)
         return output[:, :, -1].unsqueeze(dim=0).contiguous()
