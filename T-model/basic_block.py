@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-
 from .encoder import TcnEncoder
 from .decoder import LSTMDecoder
-
 
 class BasicBlock(nn.Module):
     """One Difference-Guided Refinement (DGR) block."""
